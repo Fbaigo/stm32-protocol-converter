@@ -1,0 +1,19 @@
+# Eclipse and STMCubeMX folders
+/Debug/
+/Release/
+/build/
+.settings
+.cproject
+.project
+.plugins/
+
+*.o
+*.ko
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+*.su
+*.d
+*.launch
