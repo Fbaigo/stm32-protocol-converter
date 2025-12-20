@@ -4,27 +4,23 @@
  *  Created on: Dec 15, 2025
  *      Author: federico
  */
-#include "adapter.h"
+#include "stm32f1xx_hal.h"
+#include "cmsis_os.h"
+#include <string.h>
+#include <stdlib.h>
 
-///! Hardware interfaces
-static I2C_HandleTypeDef hi2c1;
-static UART_HandleTypeDef huart1;
+///! Hardware interfaces (extern declaration in stm32f1xx_it.c)
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart1;
 
 /**
  * UART communication from/to IDE
  */
-static const uint8_t help_msg[] = "Supported commands (not case sensitive):\n"
-		"SPIUP: Start SPI1 interface\n"
-		"SPIDOWN: Terminate SPI1 interface\n"
-		"I2CUP: Start I2C1 interface\n"
-		"I2CDOWN: Terminate I2C1 interface\n"
-		"HELP: Usage of a given command";
-
-static const uint8_t i2c_help_msg[];
 
 #define CONSOLE_BUFFER_MAX_LEN	128
-osMessageQueueId_t uart_msg_queue;
-uint8_t rx_buffer[CONSOLE_BUFFER_MAX_LEN];
+
+static osMessageQueueId_t uart_rx_queue;
+static uint8_t rx_buffer[CONSOLE_BUFFER_MAX_LEN];
 
 struct console_frame {
   uint8_t data[CONSOLE_BUFFER_MAX_LEN];
@@ -33,17 +29,18 @@ struct console_frame {
 };
 
 typedef enum {CMDOK, CMDNOK} console_stat_t;
-typedef enum {CMD_SPIUP, CMD_SPIDOWN, CMD_I2CUP, CMD_I2CDOWN, CMD_HELP, CMD_TOTAL_IDS, CMD_INVALID} console_cmd_ids_t;
-char console_cmds_list[30][] = {
+typedef enum {CMD_SPIUP, CMD_SPIDOWN, CMD_I2CUP, CMD_I2CDOWN, CMD_I2CFRAME, CMD_HELP, CMD_TOTAL_IDS, CMD_INVALID} console_cmd_ids_t;
+char console_cmds_list[][30] = {
 	{"SPIUP"},
 	{"SPIDOWN"},
 	{"I2CUP"},
 	{"I2CDOWN"},
+	{"I2CFRAME"},
 	{"HELP"}
 };
 
 typedef enum {I2C_ADDR1, I2C_ADDR2, I2C_CLOCK, I2C_ADDRMODE_7B, I2C_ADDRMODE_10B, I2C_DADDRMODE, I2C_TOTAL_IDS, I2C_INVALID} i2c_param_ids_t;
-char i2c_params_list[30][] = {
+char i2c_params_list[][30] = {
 		{"ADDR1"},
 		{"ADDR2"},
 		{"CLOCK"},
@@ -51,6 +48,46 @@ char i2c_params_list[30][] = {
 		{"ADDRMODE10B"},
 		{"DADDRMODE"}
 };
+
+static console_stat_t process_directive(struct console_frame msg);
+static console_cmd_ids_t get_cmd_id_from_string(char* param);
+
+static i2c_param_ids_t get_i2c_param_id_from_string(char *param);
+static console_stat_t i2c_up_directive(char *r_arg, char *r_param);
+static console_stat_t set_i2c_param(i2c_param_ids_t param_id, uint32_t val);
+static void i2c1_default_conf(void);
+
+static void adapter_gpio_init(void);
+
+static void uart_init(void);
+static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size);
+static void uart_rx_error_cb(UART_HandleTypeDef *huart);
+//static void uart_rx_complete_cb(UART_HandleTypeDef *huart);
+static void iface_error_handler(void);
+
+static const uint8_t help_msg[] =
+		"Supported commands (not case sensitive):\n"
+		"SPIUP: Start SPI1 interface\n"
+		"SPIDOWN: Terminate SPI1 interface\n"
+		"I2CUP: Start I2C1 interface\n"
+		"I2CDOWN: Terminate I2C1 interface\n"
+		"HELP: Usage of a given command";
+
+static const uint8_t i2c_help_msg[] =
+		"The start of frame must be a valid command. See HELP for more\n"
+		"I2C Configuration format: CMD:ARG=VAL:ARG=VAL"
+		"For example: I2CUP:ADDR1=1:ADDR2=2\n"
+		"I2C frame to slave format: CMD:FRAME:FRAME:FRAME"
+		"Supported arguments for I2C\n"
+		"ADDR1 Own : address #1\n"
+		"ADDR2 Own : address #1\n"
+		"CLOCK I2C : communication speed\n"
+		"ADDRMODE7B : I2C addressing mode 7bits of address\n"
+		"ADDRMODE10B : I2C addressing mode 10bits of address\n";
+
+static const uint8_t hal_iface_error_msg[] =
+		"Failed to initialize desired interface";
+
 
 /**
  * Tasks
@@ -74,26 +111,37 @@ static const osThreadAttr_t blinker_task_attr = {
 };
 
 
-
 ///! Initialization
-void setup_core_tasks(void){
-  uart_msg_queue = osMessageQueueNew(1, sizeof(console_frame), NULL);
+void initialize_adapter(void){
+	adapter_gpio_init();
+	uart_init();
 
-  console_task_handler = osThreadNew(console_task, NULL, &console_task_attr);
-  led_task_handler = osThreadNew(blinker_task, NULL, &blinker_task_attr);
+	///! Register required callbacks and place the UART in receive mode (interrupt)
+	//HAL_UART_RegisterCallback(&huart1, HAL_UART_RX_COMPLETE_CB_ID, uart_rx_complete_cb);
+	HAL_UART_RegisterCallback(&huart1, HAL_UART_ERROR_CB_ID, uart_rx_error_cb);
+	HAL_UART_RegisterRxEventCallback(&huart1, uart_rx_idle_cb);
+
+	HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
+	//HAL_UART_Receive_IT(&huart1, rx_buffer, sizeof(rx_buffer));
+
+	osKernelInitialize();
+
+	uart_rx_queue = osMessageQueueNew(1, sizeof(struct console_frame), NULL);
+	console_task_handler = osThreadNew(console_task, NULL, &console_task_attr);
+	blinker_task_handler = osThreadNew(blinker_task, NULL, &blinker_task_attr);
+
+	osKernelStart();
 }
 
-///! Core
-
-
-void console_task(void *argument)
+///! Adapter tasks
+static void console_task(void *argument)
 {
-	console_frame_t msg;
+	struct console_frame msg;
 	osStatus_t status;
 
 	while(1)
 	{
-	    status = osMessageQueueGet(uart_msg_queue, &msg, NULL, osWaitForever);
+	    status = osMessageQueueGet(uart_rx_queue, &msg, NULL, osWaitForever);
 	    if (status == osOK) {
 	    	process_directive(msg);
 	    }
@@ -125,10 +173,57 @@ static void blinker_task(void *argument)
 }
 
 /**
- *
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void adapter_gpio_init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+}
+
+/**
+ * UART interface
  */
-static void usart1_rx_to_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
-	console_frame_t msg;
+/**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void uart_init(void)
+{
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    iface_error_handler();
+  }
+}
+
+static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
+	struct console_frame msg;
 	size_t _size;
 
 	if( !__HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE) ){
@@ -140,18 +235,11 @@ static void usart1_rx_to_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
 	_size = size > sizeof(rx_buffer) ? sizeof(rx_buffer) : size;
     memcpy(msg.data, rx_buffer, _size);
 
-    if(msg.data[0] > TOTAL_IDS){
-    	msg.id = INVALID;
-    }
-    else {
-    	msg.id = (console_ids_t) msg.data[0];
-    }
-
-    osMessageQueuePut(uart_msg_queue, &msg, 0U, 0U);
+    osMessageQueuePut(uart_rx_queue, &msg, 0U, 0U);
 	HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 }
 
-void uart_rx_error_cb(UART_HandleTypeDef *huart){
+static void uart_rx_error_cb(UART_HandleTypeDef *huart){
 	uint32_t uart_error = HAL_UART_GetError(huart); ///! See /** @defgroup UART_Error_Code UART Error Code stm32f1xx_hal_uart.h
 
 	switch(uart_error){
@@ -162,34 +250,6 @@ void uart_rx_error_cb(UART_HandleTypeDef *huart){
 		default:
 			break;
 	}
-}
-
-void uart_rx_complete_cb(UART_HandleTypeDef *huart){
-	console_frame_t msg;
-
-    memcpy(msg.data, rx_buffer, 4);
-
-    if(msg.data[0] > TOTAL_IDS){
-    	msg.id = INVALID;
-    }
-    else {
-    	msg.id = (console_ids_t) msg.data[0];
-    }
-
-    osMessageQueuePut(uart_msg_queue, &msg, 0U, 0U);
-
-	__HAL_UART_FLUSH_DRREGISTER(huart);	///! Just in case to avoid ORE error
-	HAL_UART_Receive_IT(&huart1, rx_buffer, sizeof(rx_buffer));
-}
-
-void uart_cb_init(){
-  ///! Register a callback and place the UART in receive mode (interrupt)
-  HAL_UART_RegisterCallback(&huart1, HAL_UART_RX_COMPLETE_CB_ID, uart_rx_complete_cb);
-  HAL_UART_RegisterCallback(&huart1, HAL_UART_ERROR_CB_ID, uart_rx_error_cb);
-  HAL_UART_RegisterRxEventCallback(&huart1, usart1_rx_to_idle_cb);
-
-  HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
-  //HAL_UART_Receive_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 }
 
 /**
@@ -229,7 +289,7 @@ static i2c_param_ids_t get_i2c_param_id_from_string(char *param){
 /**
  * SPI
  */
-static void spi_up_directive(){
+/*static void spi_up_directive(){
 	do {
 		val = strtok_r(NULL, "=", &r_param);
 		if(val != NULL){
@@ -238,7 +298,7 @@ static void spi_up_directive(){
 		token = strtok_r(NULL, ":", &r_arg);
 		param = strtok_r(token, "=", &r_param);
 	} while(token);
-}
+}*/
 
 /**
   * @brief I2C1 Initialization Function
@@ -261,7 +321,9 @@ static void i2c1_default_conf(void)
 /**
  * TODO: check values range
  */
-static void set_i2c_param(i2c_param_ids_t param_id, uint32_t val){
+static console_stat_t set_i2c_param(i2c_param_ids_t param_id, uint32_t val){
+	console_stat_t retval = CMDOK;
+
 	switch(param_id){
 		case I2C_ADDR1:
 			  hi2c1.Init.OwnAddress1 = val;
@@ -289,48 +351,74 @@ static void set_i2c_param(i2c_param_ids_t param_id, uint32_t val){
 
 		case I2C_INVALID:
 		default:
+			retval = CMDNOK;
 			break;
 	}
+
+	return retval;
 }
 
-
-
-static void i2c_up_directive(char *r_arg, char *r_param){
+static console_stat_t i2c_up_directive(char *r_arg, char *r_param){
 	i2c_param_ids_t i2c_param;
 	char *token, *val, *param;
+	console_stat_t retval = CMDOK;
 
 	do {
 		val = strtok_r(NULL, "=", &r_param);
 		if(val != NULL){
 			i2c_param = get_i2c_param_id_from_string(param);
-			set_i2c_param(i2c_param, atoi(val));
+			retval = set_i2c_param(i2c_param, atoi(val));
+		}
+
+		if(retval != CMDOK){
+			break;
 		}
 
 		token = strtok_r(NULL, ":", &r_arg);
 		param = strtok_r(token, "=", &r_param);
 	} while(token);
-}
 
+	return retval;
+}
 
 static console_stat_t process_directive(struct console_frame msg){
 	console_stat_t status = CMDOK;
 	console_cmd_ids_t cmd;
 	char *token, *val, *param;
     char *r_arg=NULL, *r_param=NULL;
+    const char *arg_delim =":", *param_delim="=";
 
 	///! Example: I2CUP:ADDR1=1:ADDR2=2
-    token = strtok_r((char*)msg, ":", &r_arg);
-	param = strtok_r(token, "=", &r_param);
+    token = strtok_r((char*)msg.data, arg_delim, &r_arg);
+	param = strtok_r(token, param_delim, &r_param);
 	cmd = get_cmd_id_from_string(param);
 
 	switch(cmd){
 		case CMD_SPIUP:
-			spi_up_directive();
+			//spi_up_directive();
 			break;
 
 		case CMD_I2CUP:
 			i2c1_default_conf();
-			i2c_up_directive(r_arg, r_param);
+			status = i2c_up_directive(r_arg, r_param);
+
+			if(status != CMDOK){
+				HAL_UART_Transmit(&huart1, i2c_help_msg, sizeof(i2c_help_msg), 0xFFFF);
+			}
+			else if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg), 0xFFFF);
+				status = CMDNOK;
+			}
+			break;
+
+		case CMD_I2CDOWN:
+			if(HAL_I2C_DeInit(&hi2c1) != HAL_OK){
+				status = CMDNOK;
+			}
+
+			break;
+
+		case CMD_I2CFRAME:
 			break;
 
 		case CMD_HELP:
@@ -344,6 +432,20 @@ static console_stat_t process_directive(struct console_frame msg){
 			break;
 	}
 
-
 	return status;
+}
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+static void iface_error_handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }

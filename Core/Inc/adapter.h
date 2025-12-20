@@ -8,15 +8,6 @@
 #ifndef INC_ADAPTER_H_
 #define INC_ADAPTER_H_
 
-#include "stm32f1xx_hal.h"
-#include "cmsis_os.h"
-#include <string.h>
-#include <stdlib.h>
-
-
-
-void uart_rx_complete_cb(UART_HandleTypeDef *huart);
-void setup_core_tasks(void);
-
+void initialize_adapter(void);
 
 #endif /* INC_ADAPTER_H_ */
