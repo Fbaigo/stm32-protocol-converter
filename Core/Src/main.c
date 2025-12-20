@@ -1,6 +1,6 @@
+#include "adapter.h"
 #include "main.h"
 #include "cmsis_os.h"
-#include "core_tasks.h"
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
