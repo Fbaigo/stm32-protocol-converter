@@ -29,14 +29,15 @@ struct console_frame {
 };
 
 typedef enum {CMDOK, CMDNOK} console_stat_t;
-typedef enum {CMD_SPIUP, CMD_SPIDOWN, CMD_I2CUP, CMD_I2CDOWN, CMD_I2CFRAME, CMD_HELP, CMD_TOTAL_IDS, CMD_INVALID} console_cmd_ids_t;
+typedef enum {CMD_SPIUP, CMD_SPIDOWN, CMD_I2CUP, CMD_I2CDOWN, CMD_I2CFRAME, CMD_HELP, CMD_I2CHELP, CMD_TOTAL_IDS, CMD_INVALID} console_cmd_ids_t;
 char console_cmds_list[][30] = {
 	{"SPIUP"},
 	{"SPIDOWN"},
 	{"I2CUP"},
 	{"I2CDOWN"},
 	{"I2CFRAME"},
-	{"HELP"}
+	{"HELP"},
+	{"I2CHELP"}
 };
 
 typedef enum {I2C_ADDR1, I2C_ADDR2, I2C_CLOCK, I2C_ADDRMODE_7B, I2C_ADDRMODE_10B, I2C_DADDRMODE, I2C_TOTAL_IDS, I2C_INVALID} i2c_param_ids_t;
@@ -66,12 +67,14 @@ static void uart_rx_error_cb(UART_HandleTypeDef *huart);
 static void iface_error_handler(void);
 
 static const uint8_t help_msg[] =
-		"Supported commands (not case sensitive):\n"
-		"SPIUP: Start SPI1 interface\n"
-		"SPIDOWN: Terminate SPI1 interface\n"
-		"I2CUP: Start I2C1 interface\n"
-		"I2CDOWN: Terminate I2C1 interface\n"
-		"HELP: Usage of a given command";
+		"----------------------------------------\n"
+		"Supported commands\n"
+		"----------------------------------------\n"
+		"\tSPIUP  : Start SPI1 interface\n"
+		"\tSPIDOWN: Terminate SPI1 interface\n"
+		"\tI2CUP  : Start I2C1 interface\n"
+		"\tI2CDOWN: Terminate I2C1 interface\n"
+		"\tHELP   : This message";
 
 static const uint8_t i2c_help_msg[] =
 		"The start of frame must be a valid command. See HELP for more\n"
@@ -225,18 +228,19 @@ static void uart_init(void)
 static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
 	struct console_frame msg;
 	size_t _size;
+	uint32_t flag = __HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE);
 
-	if( !__HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE) ){
+	/*if(!flag){
 		__HAL_UART_FLUSH_DRREGISTER(huart);
 		HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 		return;
-	}
+	}*/
 
 	_size = size > sizeof(rx_buffer) ? sizeof(rx_buffer) : size;
     memcpy(msg.data, rx_buffer, _size);
 
     osMessageQueuePut(uart_rx_queue, &msg, 0U, 0U);
-	HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
+    return;
 }
 
 static void uart_rx_error_cb(UART_HandleTypeDef *huart){
@@ -413,6 +417,7 @@ static console_stat_t process_directive(struct console_frame msg){
 
 		case CMD_I2CDOWN:
 			if(HAL_I2C_DeInit(&hi2c1) != HAL_OK){
+				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg), 0xFFFF);
 				status = CMDNOK;
 			}
 
@@ -422,16 +427,21 @@ static console_stat_t process_directive(struct console_frame msg){
 			break;
 
 		case CMD_HELP:
-			HAL_UART_Transmit(&huart1, help_msg, sizeof(help_msg), 0xFFFF);
+			HAL_UART_Transmit(&huart1, help_msg, sizeof(help_msg)-1, 0xFFFF); ///! sizeof includes the null character
+			break;
+
+		case CMD_I2CHELP:
+			HAL_UART_Transmit(&huart1, i2c_help_msg, sizeof(i2c_help_msg)-1, 0xFFFF); ///! sizeof includes the null character
 			break;
 
 		case CMD_INVALID:
 		default:
-			HAL_UART_Transmit(&huart1, help_msg, sizeof(help_msg), 0xFFFF);
+			HAL_UART_Transmit(&huart1, help_msg, sizeof(help_msg)-1, 0xFFFF); ///! sizeof includes the null character
 			status = CMDNOK;
 			break;
 	}
 
+	HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 	return status;
 }
 
