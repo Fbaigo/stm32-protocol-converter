@@ -42,18 +42,24 @@ char console_cmds_list[][30] = {
 
 typedef enum {I2C_ADDR1, I2C_ADDR2, I2C_CLOCK, I2C_ADDRMODE_7B, I2C_ADDRMODE_10B, I2C_DADDRMODE, I2C_TOTAL_IDS, I2C_INVALID} i2c_param_ids_t;
 char i2c_params_list[][30] = {
-		{"ADDR1"},
-		{"ADDR2"},
-		{"CLOCK"},
-		{"ADDRMODE7B"},
-		{"ADDRMODE10B"},
-		{"DADDRMODE"}
+	{"ADDR1"},
+	{"ADDR2"},
+	{"CLOCK"},
+	{"ADDRMODE7B"},
+	{"ADDRMODE10B"},
+	{"DADDRMODE"}
+};
+
+typedef enum {I2C_TX, I2C_RX, I2C_NOSTATE} i2c_state_set_t;
+char i2c_state_list[][30] = {
+	{"RX"}
 };
 
 static console_stat_t process_directive(struct console_frame msg);
 static console_cmd_ids_t get_cmd_id_from_string(char* param);
 
 static i2c_param_ids_t get_i2c_param_id_from_string(char *param);
+static console_stat_t i2c_send_frame_directive(char *r_arg, char *r_param);
 static console_stat_t i2c_up_directive(char *r_arg, char *r_param);
 static console_stat_t set_i2c_param(i2c_param_ids_t param_id, uint32_t val);
 static void i2c1_default_conf(void);
@@ -70,26 +76,36 @@ static const uint8_t help_msg[] =
 		"----------------------------------------\n"
 		"Supported commands\n"
 		"----------------------------------------\n"
-		"\tSPIUP  : Start SPI1 interface\n"
-		"\tSPIDOWN: Terminate SPI1 interface\n"
-		"\tI2CUP  : Start I2C1 interface\n"
-		"\tI2CDOWN: Terminate I2C1 interface\n"
-		"\tHELP   : This message";
+		"<SPIUP>   : Start SPI1 interface\n"
+		"<SPIDOWN> : Terminate SPI1 interface\n"
+		"<I2CUP>   : Start I2C1 interface\n"
+		"<I2CDOWN> : Terminate I2C1 interface\n"
+		"<HELP>    : This message";
 
 static const uint8_t i2c_help_msg[] =
-		"The start of frame must be a valid command. See HELP for more\n"
-		"I2C Configuration format: CMD:ARG=VAL:ARG=VAL"
-		"For example: I2CUP:ADDR1=1:ADDR2=2\n"
-		"I2C frame to slave format: CMD:FRAME:FRAME:FRAME"
+		"--------------------------------------------------------------\n"
+		"I2C supported parameters\n"
+		"--------------------------------------------------------------\n"
 		"Supported arguments for I2C\n"
-		"ADDR1 Own : address #1\n"
-		"ADDR2 Own : address #1\n"
-		"CLOCK I2C : communication speed\n"
-		"ADDRMODE7B : I2C addressing mode 7bits of address\n"
-		"ADDRMODE10B : I2C addressing mode 10bits of address\n";
+		"<ADDR1>		: Own address #1\n"
+		"<ADDR2>		: Own address #2\n"
+		"<CLOCK>		: I2C communication speed\n"
+		"<ADDRMODE7B>	: I2C addressing mode 7bits of address\n"
+		"<ADDRMODE10B>	: I2C addressing mode 10bits of address\n\n"
+		"The start of frame must be a valid command\n"
+		"See HELP for more\n\n"
+		"I2C Configuration format CMD:ARG=VAL:ARG=VAL\n"
+		"For example: I2CUP:ADDR1=1:ADDR2=2\n\n"
+		"I2C frame to slave format: I2CFRAME:FRAME:FRAME:FRAME:RX\n"
+		"For example: I2CFRAME:0x1:0x10:0x3\n"
+		"If ending RX is in frame the device is set in I2C reception mode\n";
+;
 
 static const uint8_t hal_iface_error_msg[] =
-		"Failed to initialize desired interface";
+		"Failed to setup the desired interface";
+
+static const uint8_t hal_iface_success_msg[] =
+		"Successfully modified the desired interface";
 
 
 /**
@@ -158,7 +174,6 @@ static void console_task(void *argument)
 
 static void blinker_task(void *argument)
 {
-  osStatus_t  status;
   const uint32_t delay = 1000;
 
   while(1)
@@ -228,7 +243,7 @@ static void uart_init(void)
 static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
 	struct console_frame msg;
 	size_t _size;
-	uint32_t flag = __HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE);
+	//uint32_t flag = __HAL_UART_GET_FLAG(huart, UART_FLAG_IDLE);
 
 	/*if(!flag){
 		__HAL_UART_FLUSH_DRREGISTER(huart);
@@ -238,6 +253,8 @@ static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size){
 
 	_size = size > sizeof(rx_buffer) ? sizeof(rx_buffer) : size;
     memcpy(msg.data, rx_buffer, _size);
+
+	__HAL_UART_FLUSH_DRREGISTER(&huart1);
 
     osMessageQueuePut(uart_rx_queue, &msg, 0U, 0U);
     return;
@@ -320,6 +337,7 @@ static void i2c1_default_conf(void)
   hi2c1.Init.OwnAddress2 = 0;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  hi2c1.Mode;
 }
 
 /**
@@ -385,10 +403,33 @@ static console_stat_t i2c_up_directive(char *r_arg, char *r_param){
 	return retval;
 }
 
+static console_stat_t i2c_send_frame_directive(char *r_arg, char *r_param){
+	i2c_param_ids_t i2c_param;
+	char *token, *val, *param;
+	console_stat_t retval = CMDOK;
+
+	do {
+		val = strtok_r(NULL, "=", &r_param);
+		if(val != NULL){
+			i2c_param = get_i2c_param_id_from_string(param);
+			retval = set_i2c_param(i2c_param, atoi(val));
+		}
+
+		if(retval != CMDOK){
+			break;
+		}
+
+		token = strtok_r(NULL, ":", &r_arg);
+		param = strtok_r(token, "=", &r_param);
+	} while(token);
+
+	return retval;
+}
+
 static console_stat_t process_directive(struct console_frame msg){
 	console_stat_t status = CMDOK;
 	console_cmd_ids_t cmd;
-	char *token, *val, *param;
+	char *token, *param;
     char *r_arg=NULL, *r_param=NULL;
     const char *arg_delim =":", *param_delim="=";
 
@@ -407,20 +448,25 @@ static console_stat_t process_directive(struct console_frame msg){
 			status = i2c_up_directive(r_arg, r_param);
 
 			if(status != CMDOK){
-				HAL_UART_Transmit(&huart1, i2c_help_msg, sizeof(i2c_help_msg), 0xFFFF);
+				HAL_UART_Transmit(&huart1, i2c_help_msg, sizeof(i2c_help_msg)-1, 0xFFFF);
 			}
 			else if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
-				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg), 0xFFFF);
+				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg)-1, 0xFFFF);
 				status = CMDNOK;
+			}
+			else {
+				HAL_UART_Transmit(&huart1, hal_iface_success_msg, sizeof(hal_iface_success_msg)-1, 0xFFFF);
 			}
 			break;
 
 		case CMD_I2CDOWN:
 			if(HAL_I2C_DeInit(&hi2c1) != HAL_OK){
-				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg), 0xFFFF);
+				HAL_UART_Transmit(&huart1, hal_iface_error_msg, sizeof(hal_iface_error_msg)-1, 0xFFFF);
 				status = CMDNOK;
 			}
-
+			else {
+				HAL_UART_Transmit(&huart1, hal_iface_success_msg, sizeof(hal_iface_success_msg)-1, 0xFFFF);
+			}
 			break;
 
 		case CMD_I2CFRAME:
