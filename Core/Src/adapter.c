@@ -17,7 +17,7 @@ UART_HandleTypeDef huart1;
  * UART communication from/to IDE
  */
 
-#define CONSOLE_BUFFER_MAX_LEN	128
+#define CONSOLE_BUFFER_MAX_LEN	512
 
 static osMessageQueueId_t uart_rx_queue;
 static uint8_t rx_buffer[CONSOLE_BUFFER_MAX_LEN];
@@ -28,6 +28,7 @@ struct console_frame {
   uint8_t id;
 };
 
+/* Supported UART commands */
 typedef enum {CMDOK, CMDNOK} console_stat_t;
 typedef enum {CMD_SPIUP, CMD_SPIDOWN, CMD_I2CUP, CMD_I2CDOWN, CMD_I2CFRAME, CMD_HELP, CMD_I2CHELP, CMD_TOTAL_IDS, CMD_INVALID} console_cmd_ids_t;
 char console_cmds_list[][30] = {
@@ -40,6 +41,7 @@ char console_cmds_list[][30] = {
 	{"I2CHELP"}
 };
 
+/* Supported parameters for I2CUP */
 typedef enum {I2C_ADDR1, I2C_ADDR2, I2C_CLOCK, I2C_ADDRMODE_7B, I2C_ADDRMODE_10B, I2C_DADDRMODE, I2C_TOTAL_IDS, I2C_INVALID} i2c_param_ids_t;
 char i2c_params_list[][30] = {
 	{"ADDR1"},
@@ -50,38 +52,49 @@ char i2c_params_list[][30] = {
 	{"DADDRMODE"}
 };
 
+/* I2C state after I2CFRAME is issue*/
 typedef enum {I2C_TX, I2C_RX, I2C_NOSTATE} i2c_state_set_t;
 char i2c_state_list[][30] = {
 	{"RX"}
 };
 
+/* UART command processing */
 static console_stat_t process_directive(struct console_frame msg);
 static console_cmd_ids_t get_cmd_id_from_string(char* param);
 
+/* I2C command processing */
 static i2c_param_ids_t get_i2c_param_id_from_string(char *param);
-static console_stat_t i2c_send_frame_directive(char *r_arg, char *r_param);
+static console_stat_t i2c_send_frame_directive(char *r_arg);
 static console_stat_t i2c_up_directive(char *r_arg, char *r_param);
 static console_stat_t set_i2c_param(i2c_param_ids_t param_id, uint32_t val);
 static void i2c1_default_conf(void);
 
+/* HW */
 static void adapter_gpio_init(void);
-
 static void uart_init(void);
+
+/* UART callbacks*/
 static void uart_rx_idle_cb(UART_HandleTypeDef *huart, uint16_t size);
 static void uart_rx_error_cb(UART_HandleTypeDef *huart);
 //static void uart_rx_complete_cb(UART_HandleTypeDef *huart);
 static void iface_error_handler(void);
 
+/* UART reply messages */
+
+/* UART HELP command issued */
 static const uint8_t help_msg[] =
 		"----------------------------------------\n"
 		"Supported commands\n"
 		"----------------------------------------\n"
-		"<SPIUP>   : Start SPI1 interface\n"
-		"<SPIDOWN> : Terminate SPI1 interface\n"
-		"<I2CUP>   : Start I2C1 interface\n"
-		"<I2CDOWN> : Terminate I2C1 interface\n"
-		"<HELP>    : This message";
+		"<SPIUP>   	: Start SPI1 interface\n"
+		"<SPIDOWN> 	: Terminate SPI1 interface\n"
+		"<I2CUP>   	: Start I2C1 interface\n"
+		"<I2CDOWN> 	: Terminate I2C1 interface\n"
+		"<I2CFRAME>	: Send I2C frame/s\n"
+		"<I2CHELP>	: Show I2C supported commands and parameters\n"
+		"<HELP>    	: This message";
 
+/* UART I2CHELP command issued */
 static const uint8_t i2c_help_msg[] =
 		"--------------------------------------------------------------\n"
 		"I2C supported parameters\n"
@@ -96,9 +109,10 @@ static const uint8_t i2c_help_msg[] =
 		"See HELP for more\n\n"
 		"I2C Configuration format CMD:ARG=VAL:ARG=VAL\n"
 		"For example: I2CUP:ADDR1=1:ADDR2=2\n\n"
-		"I2C frame to slave format: I2CFRAME:FRAME:FRAME:FRAME:RX\n"
-		"For example: I2CFRAME:0x1:0x10:0x3\n"
-		"If ending RX is in frame the device is set in I2C reception mode\n";
+		"I2C frame to slave format: I2CFRAME:SLAVEADDR:FRAME:FRAME:FRAME:RX\n"
+		"For example: I2CFRAME:0x3C:0x1:0x10:0x3\n"
+		"If ending RX is in frame the device is set in I2C reception mode\n"
+		"after sending frames\n";
 ;
 
 static const uint8_t hal_iface_error_msg[] =
@@ -117,9 +131,11 @@ static osThreadId_t blinker_task_handler;
 static void console_task(void *argument);
 static void blinker_task(void *args);
 
+///! Watch out the stack. Increasing the CONSOLE_BUFFER_MAX_LEN variable will demand more stack size
+///! Running short will prevent the scheduler to run properly or even fail (will trigger a hard fault exception)
 static const osThreadAttr_t console_task_attr = {
   .name = "Console",
-  .stack_size = 128 * 4,
+  .stack_size = 128 * 16,
   .priority = (osPriority_t) osPriorityNormal,
 };
 
@@ -274,7 +290,7 @@ static void uart_rx_error_cb(UART_HandleTypeDef *huart){
 }
 
 /**
- * Handling of IDE directives and parsing
+ * Handling of UART client directives and parsing
  */
 
 static console_cmd_ids_t get_cmd_id_from_string(char* param){
@@ -337,7 +353,6 @@ static void i2c1_default_conf(void)
   hi2c1.Init.OwnAddress2 = 0;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
   hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  hi2c1.Mode;
 }
 
 /**
@@ -403,25 +418,44 @@ static console_stat_t i2c_up_directive(char *r_arg, char *r_param){
 	return retval;
 }
 
-static console_stat_t i2c_send_frame_directive(char *r_arg, char *r_param){
-	i2c_param_ids_t i2c_param;
-	char *token, *val, *param;
+static console_stat_t i2c_send_frame_directive(char *r_arg){
+	char *val;
+	uint8_t i2c_buffer[CONSOLE_BUFFER_MAX_LEN];
+	uint16_t i=0;
+
 	console_stat_t retval = CMDOK;
+	uint16_t slave_addr;
+	uint32_t timeout = 0xffff;
+
+	memset(i2c_buffer, 0, sizeof(i2c_buffer));
+
+	val = strtok_r(NULL, ":", &r_arg);
+	slave_addr = strtol(val, NULL, 16);
+
+	if(slave_addr > 0x7F){
+		retval = CMDNOK;
+		return retval;
+	}
+
+	slave_addr = slave_addr << 1;
 
 	do {
-		val = strtok_r(NULL, "=", &r_param);
-		if(val != NULL){
-			i2c_param = get_i2c_param_id_from_string(param);
-			retval = set_i2c_param(i2c_param, atoi(val));
+		val = strtok_r(NULL, ":", &r_arg);
+		i2c_buffer[i] = (uint8_t) strtol(val, NULL, 16);
+		i++;
+
+		if(i > CONSOLE_BUFFER_MAX_LEN-1){
+			i--; break;
 		}
 
-		if(retval != CMDOK){
-			break;
-		}
+	} while(val);
 
-		token = strtok_r(NULL, ":", &r_arg);
-		param = strtok_r(token, "=", &r_param);
-	} while(token);
+
+	if(i < CONSOLE_BUFFER_MAX_LEN-1 && i2c_buffer[i] == '\0'){
+		i--; ///! NULL character terminated, do not transmit
+	}
+
+	HAL_I2C_Master_Transmit(&hi2c1, slave_addr, i2c_buffer, i, timeout);
 
 	return retval;
 }
@@ -470,6 +504,7 @@ static console_stat_t process_directive(struct console_frame msg){
 			break;
 
 		case CMD_I2CFRAME:
+			status = i2c_send_frame_directive(r_arg);
 			break;
 
 		case CMD_HELP:
