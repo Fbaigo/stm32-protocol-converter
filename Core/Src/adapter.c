@@ -53,9 +53,9 @@ char i2c_params_list[][30] = {
 };
 
 /* I2C state after I2CFRAME is issue*/
-typedef enum {I2C_TX, I2C_RX, I2C_NOSTATE} i2c_state_set_t;
-char i2c_state_list[][30] = {
-	{"RX"}
+typedef enum {I2C_T, I2C_STATE, I2C_NOCMD} i2c_frame_cmd_t;
+char i2c_frame_cmds_list[][30] = {
+	{"T"}
 };
 
 /* UART command processing */
@@ -109,10 +109,14 @@ static const uint8_t i2c_help_msg[] =
 		"See HELP for more\n\n"
 		"I2C Configuration format CMD:ARG=VAL:ARG=VAL\n"
 		"For example: I2CUP:ADDR1=1:ADDR2=2\n\n"
-		"I2C frame to slave format: I2CFRAME:SLAVEADDR:FRAME:FRAME:FRAME:RX\n"
-		"For example: I2CFRAME:0x3C:0x1:0x10:0x3\n"
-		"If ending RX is in frame the device is set in I2C reception mode\n"
-		"after sending frames\n";
+		"I2C frame to slave format: I2CFRAME:SLAVEADDR:FRAME:FRAME:CMD:FRAME\n"
+		"--------------------------------------------------------------\n"
+		"I2C frame supported commands\n"
+		"--------------------------------------------------------------\n"
+		"<T>: Delay time in ms\n\n"
+		"Examples:\n"
+		"Frame example: I2CFRAME:0x3C:0x1:0x10:0x3\n"
+		"Delay example: I2CFRAME:0x3C:0x1:0x10:T=30:0x3\n"
 ;
 
 static const uint8_t hal_iface_error_msg[] =
@@ -156,6 +160,7 @@ void initialize_adapter(void){
 	HAL_UART_RegisterCallback(&huart1, HAL_UART_ERROR_CB_ID, uart_rx_error_cb);
 	HAL_UART_RegisterRxEventCallback(&huart1, uart_rx_idle_cb);
 
+	memset(rx_buffer, 0x0, sizeof(rx_buffer));
 	HAL_UARTEx_ReceiveToIdle_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 	//HAL_UART_Receive_IT(&huart1, rx_buffer, sizeof(rx_buffer));
 
@@ -282,6 +287,7 @@ static void uart_rx_error_cb(UART_HandleTypeDef *huart){
 	switch(uart_error){
 		case HAL_UART_ERROR_ORE:
 	          __HAL_UART_CLEAR_OREFLAG(huart);
+	          __HAL_UART_FLUSH_DRREGISTER(huart);
 			break;
 
 		default:
@@ -319,6 +325,21 @@ static i2c_param_ids_t get_i2c_param_id_from_string(char *param){
 		}
 		ids++;
 	} while(ids < I2C_TOTAL_IDS);
+
+	return param_id;
+}
+
+static i2c_frame_cmd_t get_i2c_frame_param_id_from_string(char *param){
+	uint32_t ids=0;
+	i2c_frame_cmd_t param_id = I2C_NOCMD;
+
+	do {
+		if(strcmp(param, i2c_frame_cmds_list[ids]) == 0){
+			param_id = (i2c_frame_cmd_t) ids;
+			break;
+		}
+		ids++;
+	} while(ids < I2C_NOCMD);
 
 	return param_id;
 }
@@ -419,18 +440,20 @@ static console_stat_t i2c_up_directive(char *r_arg, char *r_param){
 }
 
 static console_stat_t i2c_send_frame_directive(char *r_arg){
-	char *val;
+	char *token, *param, *r_param;
 	uint8_t i2c_buffer[CONSOLE_BUFFER_MAX_LEN];
-	uint16_t i=0;
+	uint16_t bytes=0;
 
 	console_stat_t retval = CMDOK;
 	uint16_t slave_addr;
 	uint32_t timeout = 0xffff;
 
+	i2c_frame_cmd_t i2c_frame_param;
+
 	memset(i2c_buffer, 0, sizeof(i2c_buffer));
 
-	val = strtok_r(NULL, ":", &r_arg);
-	slave_addr = strtol(val, NULL, 16);
+	token = strtok_r(NULL, ":", &r_arg);
+	slave_addr = strtol(token, NULL, 16);
 
 	if(slave_addr > 0x7F){
 		retval = CMDNOK;
@@ -440,22 +463,48 @@ static console_stat_t i2c_send_frame_directive(char *r_arg){
 	slave_addr = slave_addr << 1;
 
 	do {
-		val = strtok_r(NULL, ":", &r_arg);
-		i2c_buffer[i] = (uint8_t) strtol(val, NULL, 16);
-		i++;
+		token = strtok_r(NULL, ":", &r_arg);
+		param = strtok_r(token, "=", &r_param);
 
-		if(i > CONSOLE_BUFFER_MAX_LEN-1){
-			i--; break;
+		/* End of frame stream */
+		if(token == NULL){
+			break;
 		}
 
-	} while(val);
+		if(param != NULL){
+			i2c_frame_param = get_i2c_frame_param_id_from_string(param);
 
+			switch(i2c_frame_param){
+				case I2C_T:
+					HAL_I2C_Master_Transmit(&hi2c1, slave_addr, i2c_buffer, bytes, timeout);
 
-	if(i < CONSOLE_BUFFER_MAX_LEN-1 && i2c_buffer[i] == '\0'){
-		i--; ///! NULL character terminated, do not transmit
-	}
+					param = strtok_r(NULL, "=", &r_param);
+					osDelay(atoi(param));
 
-	HAL_I2C_Master_Transmit(&hi2c1, slave_addr, i2c_buffer, i, timeout);
+					memset(i2c_buffer, 0, bytes);
+					bytes=0;
+					break;
+
+				default:
+					i2c_buffer[bytes] = (uint8_t) strtol(token, NULL, 16);
+					bytes++;
+					break;
+				}
+		}
+
+		/* Exceeded buffer size */
+		if(bytes > CONSOLE_BUFFER_MAX_LEN-1){
+			bytes--; break;
+		}
+
+	} while(token);
+
+	///! NULL character terminated, do not transmit
+	/*if(bytes > 0 && bytes < CONSOLE_BUFFER_MAX_LEN && i2c_buffer[bytes] == '\0'){
+		bytes--;
+	}*/
+
+	HAL_I2C_Master_Transmit(&hi2c1, slave_addr, i2c_buffer, bytes, timeout);
 
 	return retval;
 }
